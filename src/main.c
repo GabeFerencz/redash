@@ -77,7 +77,7 @@ void main(void) {
 	 * button is pressed. */
 	LPM4;
 
-	/* Once we're passed the first button press, Utilize LPM0 while we're
+	/* Once we're past the first button press, utilize LPM0 while we're
 	 * waiting for the countdown to complete. At that time, the final timer
 	 * interrupt will hold us in LPM4 mode on exit until the next button
 	 * press. */
