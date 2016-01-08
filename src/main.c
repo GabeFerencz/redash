@@ -26,7 +26,7 @@ SOFTWARE.
 //#define DEBUG_MODE_ON
 
 #define WDT_DISABLE()			(WDTCTL = WDTPW + WDTHOLD)
-/* Use the watchdog to interval mode, sourced by SMCLK/32768 */
+/* Use the watchdog interval mode, sourced by SMCLK/32768 */
 #define WDT_INTERVAL_MODE()		(WDTCTL = WDTPW + WDTTMSEL + WDTCNTCL)
 /* Measured watchdog interval at 28.7ms with no SMCLK divider running
  * at the default frequency.
