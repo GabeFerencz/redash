@@ -115,7 +115,7 @@ __interrupt void watchdog_isr(void)
 		/* Stop the watchdog to save energy and it's no longer required. */
 		WDT_DISABLE();
 		/* Exit the interrupt to LPM4. */
-		LPM4_EXIT;
+		_bis_SR_register_on_exit(LPM4_bits);
 	}
 #ifdef DEBUG_MODE_ON
 	/* Toggle P1.0 on every interrupt for debug. */
