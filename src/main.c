@@ -22,6 +22,7 @@ SOFTWARE.
 
  */
 #include <msp430.h>
+#include <stdbool.h>
 
 //#define DEBUG_MODE_ON
 
@@ -39,14 +40,18 @@ SOFTWARE.
 	#undef LED_TIMEOUT_INTERVALS
 	#define LED_TIMEOUT_INTERVALS	(4)
 #endif
-/* This is variable is shared between the interrupt and main threads. Be sure
- * to protect its use. */
-unsigned int shutdown_counter = 0;
 
 /* The LED output is on P1.6. It is active low. Note that this is opposite
  * of the LED configuration on the Launchpad. */
 #define LED_ACTIVATE()		(P1OUT &= ~BIT6)
 #define LED_DEACTIVATE()	(P1OUT |= BIT6)
+
+/* Set to true by the GPIO interrupt on a button press. Set to false by
+ * the main thread after it is handled. */
+bool button_pressed = false;
+/* Set to true by the WDT interrupt when an interval has completed. Set
+ * to false by the main thread after it is handled. */
+bool interval_complete = false;
 
 enum states {
 	/* In the sleep state:
@@ -54,43 +59,77 @@ enum states {
 	 * 	BUTTON: Move to the start timer state.
 	 * sleep: LPM4 to conserve as much energy as possible. */
 	STATE_SLEEP,
-	/* In the timer init/wait states:
-	 * 	LED: ON in init, unchanged in wait
+	/* In the active states:
+	 * 	LED: ON in activate, unchanged in active
 	 * 	BUTTON: Cancel timer and move to sleep state.
 	 * 	sleep: LPM0 to keep the WDT interval clock alive. */
-	STATE_TIMER_INIT,
-	STATE_TIMER_WAIT
+	STATE_ACTIVATE,
+	STATE_ACTIVE
 };
 enum states state = STATE_SLEEP;
 
 static inline void state_machine(void)
 {
+	/* Holds the count of intervals until time expiration. */
+	static unsigned int shutdown_counter = 0;
+
+	/* Start the timer if the button was pressed from the sleep state,
+	 * otherwise go back to sleep. */
 	switch(state) {
 		case STATE_SLEEP:
 			/* Ensure that the LED is off. */
 			LED_DEACTIVATE();
-			/* Stop the watchdog to save energy as it's no longer required. */
+			/* Stop the watchdog to save energy. */
 			WDT_DISABLE();
 			/* Go into LPM4, disabling all clocks and waiting for button. */
 			LPM4;
+
+			/* If woken from LPM4, it was likely from a button press, but
+			 * check to be sure. */
+			if (button_pressed) {
+				button_pressed = false;
+				state = STATE_ACTIVATE;
+			}
 			break;
-		case STATE_TIMER_INIT:
-			/* The watchdog should already be disabled at this point, but
-			 * this provides extra protection for the shutdown_counter
-			 * variable because it's edited in the WDT interrupt. */
-			WDT_DISABLE();
+
+		/* The activate state does active mode initiatialization, then
+		 * falls through to the active state. */
+		case STATE_ACTIVATE:
 			/* Initialize the countdown timer and activate the output. */
 			shutdown_counter = LED_TIMEOUT_INTERVALS;
 			LED_ACTIVATE();
 			/* Restart the watchdog timer in interval mode. */
 			WDT_INTERVAL_MODE();
-			/* Now that the active state is configured, wait for the timer. */
-			state = STATE_TIMER_WAIT;
-		case STATE_TIMER_WAIT:
+			/* Now that the active state is configured, wait for the timer
+			 * to expire or for a button press. */
+			state = STATE_ACTIVE;
+		case STATE_ACTIVE:
+			/* If an interval has completed, process it now. */
+			if (interval_complete) {
+				interval_complete = false;
+				/* Decrement the shutdown counter and check for time
+				 * expiration. */
+				if(--shutdown_counter == 0) {
+					/* The timer has expired, move to the sleep state. */
+					state = STATE_SLEEP;
+				}
+			}
 			/* Go into LPM0 because we need the WDT interval clock to run. */
 			LPM0;
+			/* If the button is pressed in the active state, move to
+			 * the sleep state. */
+			if (button_pressed) {
+				button_pressed = false;
+				state = STATE_SLEEP;
+			}
 			break;
+
 		default:
+			#ifdef DEBUG_MODE_ON
+				/* Trap here if we're in debug mode. */
+				while(1);
+			#endif
+			/* This should not be possible, but fail to the sleep state. */
 			state = STATE_SLEEP;
 			break;
 	}
@@ -130,13 +169,8 @@ void main(void) {
 #pragma vector = PORT1_VECTOR
 __interrupt void port1_isr(void)
 {
-	/* Start the timer if the button was pressed from the sleep state,
-	 * otherwise go back to sleep. */
-	if (state == STATE_SLEEP) {
-		state = STATE_TIMER_INIT;
-	} else {
-		state = STATE_SLEEP;
-	}
+	/* Let the main thread know we've just completed had a button press. */
+	button_pressed = true;
 	/* Clear the interrupt flags */
 	P1IFG = 0x0;
 	/* Allow the state machine to control the sleep mode. */
@@ -146,15 +180,12 @@ __interrupt void port1_isr(void)
 #pragma vector=WDT_VECTOR
 __interrupt void watchdog_isr(void)
 {
-	/* Decrement the shutdown counter and check for time expiration. */
-	if(--shutdown_counter == 0) {
-		/* The timer has expired, move to the sleep state. */
-		state = STATE_SLEEP;
-	}
-#ifdef DEBUG_MODE_ON
-	/* Toggle P1.0 on every interrupt for debug. */
-	P1OUT ^= BIT0;
-#endif
+	#ifdef DEBUG_MODE_ON
+		/* Toggle P1.0 on every interrupt for debug. */
+		P1OUT ^= BIT0;
+	#endif
+	/* Let the main thread know we've just completed an interval. */
+	interval_complete = true;
 	/* Allow the state machine to control the sleep mode. */
 	__low_power_mode_off_on_exit();
 }
@@ -164,8 +195,8 @@ __interrupt void watchdog_isr(void)
 	ADC10_VECTOR, TIMERA1_VECTOR, TIMERA0_VECTOR, \
 	/*WDT_VECTOR,*/ NMI_VECTOR
 __interrupt void trapisr(void) {
-#ifdef DEBUG_MODE_ON
-	/* Trap here if we're in debug mode. */
-	while(1);
-#endif
+	#ifdef DEBUG_MODE_ON
+		/* Trap here if we're in debug mode. */
+		while(1);
+	#endif
 }
