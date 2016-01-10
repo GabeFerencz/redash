@@ -39,10 +39,62 @@ SOFTWARE.
 	#undef LED_TIMEOUT_INTERVALS
 	#define LED_TIMEOUT_INTERVALS	(4)
 #endif
+/* This is variable is shared between the interrupt and main threads. Be sure
+ * to protect its use. */
+unsigned int shutdown_counter = 0;
 
-/* The LED output is on P1.6. It is active low. */
+/* The LED output is on P1.6. It is active low. Note that this is opposite
+ * of the LED configuration on the Launchpad. */
 #define LED_ACTIVATE()		(P1OUT &= ~BIT6)
 #define LED_DEACTIVATE()	(P1OUT |= BIT6)
+
+enum states {
+	/* In the sleep state:
+	 * 	LED: OFF
+	 * 	BUTTON: Move to the start timer state.
+	 * sleep: LPM4 to conserve as much energy as possible. */
+	STATE_SLEEP,
+	/* In the timer init/wait states:
+	 * 	LED: ON in init, unchanged in wait
+	 * 	BUTTON: Cancel timer and move to sleep state.
+	 * 	sleep: LPM0 to keep the WDT interval clock alive. */
+	STATE_TIMER_INIT,
+	STATE_TIMER_WAIT
+};
+enum states state = STATE_SLEEP;
+
+static inline void state_machine(void)
+{
+	switch(state) {
+		case STATE_SLEEP:
+			/* Ensure that the LED is off. */
+			LED_DEACTIVATE();
+			/* Stop the watchdog to save energy as it's no longer required. */
+			WDT_DISABLE();
+			/* Go into LPM4, disabling all clocks and waiting for button. */
+			LPM4;
+			break;
+		case STATE_TIMER_INIT:
+			/* The watchdog should already be disabled at this point, but
+			 * this provides extra protection for the shutdown_counter
+			 * variable because it's edited in the WDT interrupt. */
+			WDT_DISABLE();
+			/* Initialize the countdown timer and activate the output. */
+			shutdown_counter = LED_TIMEOUT_INTERVALS;
+			LED_ACTIVATE();
+			/* Restart the watchdog timer in interval mode. */
+			WDT_INTERVAL_MODE();
+			/* Now that the active state is configured, wait for the timer. */
+			state = STATE_TIMER_WAIT;
+		case STATE_TIMER_WAIT:
+			/* Go into LPM0 because we need the WDT interval clock to run. */
+			LPM0;
+			break;
+		default:
+			state = STATE_SLEEP;
+			break;
+	}
+}
 
 void main(void) {
 	/* Disable the watchdog as it will be used as an interval timer after
@@ -61,9 +113,6 @@ void main(void) {
 	P2DIR = 0xFF;
 	P2OUT = 0x00;
 
-	/* Start with the output disabled */
-	LED_DEACTIVATE();
-
 	/* Disable any pending P1.3 interrupts and enable the interrupt. */
 	P1IFG &= ~BIT3;
 	P1IE |= BIT3;
@@ -73,35 +122,24 @@ void main(void) {
 
 	__enable_interrupt();
 
-	/* Go into LPM4 because we start in the idle state until the
-	 * button is pressed. */
-	LPM4;
-
-	/* Once we're past the first button press, utilize LPM0 while we're
-	 * waiting for the countdown to complete. At that time, the final timer
-	 * interrupt will hold us in LPM4 mode on exit until the next button
-	 * press. */
 	while(1) {
-		LPM0;
+		state_machine();
 	}
 }
-
-/* This is variable safe, provided that interrupts are not nestable, as is the
- * case here. */
-unsigned int shutdown_counter = 0;
 
 #pragma vector = PORT1_VECTOR
 __interrupt void port1_isr(void)
 {
-	/* Start the countdown timer and activate the output. */
-	shutdown_counter = LED_TIMEOUT_INTERVALS;
-	LED_ACTIVATE();
-	/* Restart the watchdog as it was stopped on the last expiration. */
-	WDT_INTERVAL_MODE();
+	/* Start the timer if the button was pressed from the sleep state,
+	 * otherwise go back to sleep. */
+	if (state == STATE_SLEEP) {
+		state = STATE_TIMER_INIT;
+	} else {
+		state = STATE_SLEEP;
+	}
 	/* Clear the interrupt flags */
 	P1IFG = 0x0;
-	/* Remain awake after the interrupt exits. The main loop will keep us in
-	 * a lower power state until the timer expires. */
+	/* Allow the state machine to control the sleep mode. */
 	__low_power_mode_off_on_exit();
 }
 
@@ -110,17 +148,15 @@ __interrupt void watchdog_isr(void)
 {
 	/* Decrement the shutdown counter and check for time expiration. */
 	if(--shutdown_counter == 0) {
-		/* Time is up, deactivate the output and go into a deep sleep. */
-		LED_DEACTIVATE();
-		/* Stop the watchdog to save energy and it's no longer required. */
-		WDT_DISABLE();
-		/* Exit the interrupt to LPM4. */
-		_bis_SR_register_on_exit(LPM4_bits);
+		/* The timer has expired, move to the sleep state. */
+		state = STATE_SLEEP;
 	}
 #ifdef DEBUG_MODE_ON
 	/* Toggle P1.0 on every interrupt for debug. */
 	P1OUT ^= BIT0;
 #endif
+	/* Allow the state machine to control the sleep mode. */
+	__low_power_mode_off_on_exit();
 }
 
 /* An interrupt from any unused interrupt vectors does nothing */
